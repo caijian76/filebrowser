@@ -1,10 +1,11 @@
 package files
 
 import (
+	"os"
 	"unicode/utf8"
 )
 
-func isBinary(content []byte, _ int) bool {
+func isBinary(content []byte) bool {
 	maybeStr := string(content)
 	runeCnt := utf8.RuneCount(content)
 	runeIndex := 0
@@ -47,4 +48,12 @@ func isBinary(content []byte, _ int) bool {
 		return true
 	}
 	return false
+}
+
+func IsNamedPipe(mode os.FileMode) bool {
+	return mode&os.ModeNamedPipe != 0
+}
+
+func IsSymlink(mode os.FileMode) bool {
+	return mode&os.ModeSymlink != 0
 }

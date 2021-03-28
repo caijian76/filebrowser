@@ -1,12 +1,14 @@
 package http
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -19,11 +21,12 @@ import (
 
 var resourceGetHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
 	file, err := files.NewFileInfo(files.FileOptions{
-		Fs:      d.user.Fs,
-		Path:    r.URL.Path,
-		Modify:  d.user.Perm.Modify,
-		Expand:  true,
-		Checker: d,
+		Fs:         d.user.Fs,
+		Path:       r.URL.Path,
+		Modify:     d.user.Perm.Modify,
+		Expand:     true,
+		ReadHeader: d.server.TypeDetectionByHeader,
+		Checker:    d,
 	})
 	if err != nil {
 		return errToStatus(err), err
@@ -57,22 +60,21 @@ func resourceDeleteHandler(fileCache FileCache) handleFunc {
 		}
 
 		file, err := files.NewFileInfo(files.FileOptions{
-			Fs:      d.user.Fs,
-			Path:    r.URL.Path,
-			Modify:  d.user.Perm.Modify,
-			Expand:  true,
-			Checker: d,
+			Fs:         d.user.Fs,
+			Path:       r.URL.Path,
+			Modify:     d.user.Perm.Modify,
+			Expand:     true,
+			ReadHeader: d.server.TypeDetectionByHeader,
+			Checker:    d,
 		})
 		if err != nil {
 			return errToStatus(err), err
 		}
 
 		// delete thumbnails
-		for _, previewSizeName := range PreviewSizeNames() {
-			size, _ := ParsePreviewSize(previewSizeName)
-			if err := fileCache.Delete(r.Context(), previewCacheKey(file.Path, size)); err != nil { //nolint:govet
-				return errToStatus(err), err
-			}
+		err = delThumbs(r.Context(), fileCache, file)
+		if err != nil {
+			return errToStatus(err), err
 		}
 
 		err = d.RunHook(func() error {
@@ -87,12 +89,59 @@ func resourceDeleteHandler(fileCache FileCache) handleFunc {
 	})
 }
 
-var resourcePostPutHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
-	if !d.user.Perm.Create && r.Method == http.MethodPost {
-		return http.StatusForbidden, nil
-	}
+func resourcePostHandler(fileCache FileCache) handleFunc {
+	return withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+		if !d.user.Perm.Create || !d.Check(r.URL.Path) {
+			return http.StatusForbidden, nil
+		}
 
-	if !d.user.Perm.Modify && r.Method == http.MethodPut {
+		defer func() {
+			_, _ = io.Copy(ioutil.Discard, r.Body)
+		}()
+
+		// Directories creation on POST.
+		if strings.HasSuffix(r.URL.Path, "/") {
+			err := d.user.Fs.MkdirAll(r.URL.Path, 0775)
+			return errToStatus(err), err
+		}
+
+		file, err := files.NewFileInfo(files.FileOptions{
+			Fs:         d.user.Fs,
+			Path:       r.URL.Path,
+			Modify:     d.user.Perm.Modify,
+			Expand:     true,
+			ReadHeader: d.server.TypeDetectionByHeader,
+			Checker:    d,
+		})
+		if err == nil {
+			if r.URL.Query().Get("override") != "true" {
+				return http.StatusConflict, nil
+			}
+
+			err = delThumbs(r.Context(), fileCache, file)
+			if err != nil {
+				return errToStatus(err), err
+			}
+		}
+
+		err = d.RunHook(func() error {
+			info, _ := writeFile(d.user.Fs, r.URL.Path, r.Body)
+
+			etag := fmt.Sprintf(`"%x%x"`, info.ModTime().UnixNano(), info.Size())
+			w.Header().Set("ETag", etag)
+			return nil
+		}, "upload", r.URL.Path, "", d.user)
+
+		if err != nil {
+			_ = d.user.Fs.RemoveAll(r.URL.Path)
+		}
+
+		return errToStatus(err), err
+	})
+}
+
+var resourcePutHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+	if !d.user.Perm.Modify || !d.Check(r.URL.Path) {
 		return http.StatusForbidden, nil
 	}
 
@@ -100,55 +149,18 @@ var resourcePostPutHandler = withUser(func(w http.ResponseWriter, r *http.Reques
 		_, _ = io.Copy(ioutil.Discard, r.Body)
 	}()
 
-	// For directories, only allow POST for creation.
+	// Only allow PUT for files.
 	if strings.HasSuffix(r.URL.Path, "/") {
-		if r.Method == http.MethodPut {
-			return http.StatusMethodNotAllowed, nil
-		}
-
-		err := d.user.Fs.MkdirAll(r.URL.Path, 0775)
-		return errToStatus(err), err
-	}
-
-	if r.Method == http.MethodPost && r.URL.Query().Get("override") != "true" {
-		if _, err := d.user.Fs.Stat(r.URL.Path); err == nil {
-			return http.StatusConflict, nil
-		}
-	}
-
-	action := "upload"
-	if r.Method == http.MethodPut {
-		action = "save"
+		return http.StatusMethodNotAllowed, nil
 	}
 
 	err := d.RunHook(func() error {
-		dir, _ := filepath.Split(r.URL.Path)
-		err := d.user.Fs.MkdirAll(dir, 0775)
-		if err != nil {
-			return err
-		}
-
-		file, err := d.user.Fs.OpenFile(r.URL.Path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0775)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-
-		_, err = io.Copy(file, r.Body)
-		if err != nil {
-			return err
-		}
-
-		// Gets the info about the file.
-		info, err := file.Stat()
-		if err != nil {
-			return err
-		}
+		info, _ := writeFile(d.user.Fs, r.URL.Path, r.Body)
 
 		etag := fmt.Sprintf(`"%x%x"`, info.ModTime().UnixNano(), info.Size())
 		w.Header().Set("ETag", etag)
 		return nil
-	}, action, r.URL.Path, "", d.user)
+	}, "save", r.URL.Path, "", d.user)
 
 	if err != nil {
 		_ = d.user.Fs.RemoveAll(r.URL.Path)
@@ -162,6 +174,9 @@ var resourcePatchHandler = withUser(func(w http.ResponseWriter, r *http.Request,
 	dst := r.URL.Query().Get("destination")
 	action := r.URL.Query().Get("action")
 	dst, err := url.QueryUnescape(dst)
+	if !d.Check(src) || !d.Check(dst) {
+		return http.StatusForbidden, nil
+	}
 	if err != nil {
 		return errToStatus(err), err
 	}
@@ -196,9 +211,10 @@ var resourcePatchHandler = withUser(func(w http.ResponseWriter, r *http.Request,
 			if !d.user.Perm.Rename {
 				return errors.ErrPermissionDenied
 			}
-			dst = filepath.Clean("/" + dst)
+			src = path.Clean("/" + src)
+			dst = path.Clean("/" + dst)
 
-			return d.user.Fs.Rename(src, dst)
+			return fileutils.MoveFile(d.user.Fs, src, dst)
 		default:
 			return fmt.Errorf("unsupported action %s: %w", action, errors.ErrInvalidRequestParams)
 		}
@@ -221,20 +237,58 @@ func checkParent(src, dst string) error {
 	return nil
 }
 
-func addVersionSuffix(path string, fs afero.Fs) string {
+func addVersionSuffix(source string, fs afero.Fs) string {
 	counter := 1
-	dir, name := filepath.Split(path)
+	dir, name := path.Split(source)
 	ext := filepath.Ext(name)
 	base := strings.TrimSuffix(name, ext)
 
 	for {
-		if _, err := fs.Stat(path); err != nil {
+		if _, err := fs.Stat(source); err != nil {
 			break
 		}
 		renamed := fmt.Sprintf("%s(%d)%s", base, counter, ext)
-		path = filepath.ToSlash(dir) + renamed
+		source = path.Join(dir, renamed)
 		counter++
 	}
 
-	return path
+	return source
+}
+
+func writeFile(fs afero.Fs, dst string, in io.Reader) (os.FileInfo, error) {
+	dir, _ := path.Split(dst)
+	err := fs.MkdirAll(dir, 0775)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := fs.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0775)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, in)
+	if err != nil {
+		return nil, err
+	}
+
+	// Gets the info about the file.
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	return info, nil
+}
+
+func delThumbs(ctx context.Context, fileCache FileCache, file *files.FileInfo) error {
+	for _, previewSizeName := range PreviewSizeNames() {
+		size, _ := ParsePreviewSize(previewSizeName)
+		if err := fileCache.Delete(ctx, previewCacheKey(file.Path, file.ModTime.Unix(), size)); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
